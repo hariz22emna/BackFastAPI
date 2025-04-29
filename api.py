@@ -3,18 +3,26 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import joblib
 import numpy as np
+import pandas as pd
 from typing import List
 from sqlalchemy import create_engine
-import pandas as pd
 
-# Charger le modèle
-model = joblib.load("model_xgb.pkl")
+# =============================
+# 🔹 Chargement des modèles
+# =============================
+model_wait = joblib.load("model_xgb.pkl")                     # Modèle temps d’attente
+model_surcharge = joblib.load("gradient_boosting_model.pkl")  # Modèle surcharge
+encoders = joblib.load("label_encoders.pkl")                  # LabelEncoders pour catégorielles
 
-# Connexion MySQL
+# =============================
+# 🔹 Connexion MySQL
+# =============================
 DB_URL = "mysql+mysqlconnector://root:@localhost/pfadataset"
 engine = create_engine(DB_URL)
 
-# Colonnes attendues
+# =============================
+# 🔹 Colonnes d’entrée (temps d’attente)
+# =============================
 feature_names = [
     "urgency_level",
     "nurse-to-patient_ratio",
@@ -24,20 +32,21 @@ feature_names = [
     "available_beds_%"
 ]
 
-# Initialiser l'app FastAPI
+# =============================
+# 🔹 Initialisation FastAPI
+# =============================
 app = FastAPI()
 
-# Configuration CORS (pour Angular)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:53440"],
+    allow_origins=["http://localhost:53440"],  # Adresse front-end
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 # =============================
-# 🎯 Input model
+# 🔹 Modèles d’entrée
 # =============================
 class InputData(BaseModel):
     features: List[float]
@@ -45,8 +54,24 @@ class InputData(BaseModel):
 class BatchInput(BaseModel):
     features_batch: List[List[float]]
 
+class SurchargeInput(BaseModel):
+    visit_date: str
+    day_of_week: str
+    available_beds: float
+    urgency_level: str
+    season: str
+    local_event: int
+    nurse_to_patient_ratio: int
+
 # =============================
-# 🔹 /predict : prédiction simple
+# 🔹 Home route
+# =============================
+@app.get("/")
+def home():
+    return {"message": "🎯 API FastAPI pour prédiction du temps d’attente et surcharge"}
+
+# =============================
+# 🔹 /predict : prédiction simple (temps d’attente)
 # =============================
 @app.post("/predict")
 def predict(data: InputData):
@@ -56,11 +81,11 @@ def predict(data: InputData):
             "expected_order": feature_names
         }
     input_array = np.array(data.features).reshape(1, -1)
-    prediction = model.predict(input_array)
+    prediction = model_wait.predict(input_array)
     return {"prediction": float(prediction[0])}
 
 # =============================
-# 🔹 /batch_predict : plusieurs prédictions
+# 🔹 /batch_predict : prédictions multiples
 # =============================
 @app.post("/batch_predict")
 def batch_predict(data: BatchInput):
@@ -70,11 +95,11 @@ def batch_predict(data: BatchInput):
             "error": f"Each row must have {len(feature_names)} features, got {batch.shape[1]}",
             "expected_order": feature_names
         }
-    predictions = model.predict(batch)
+    predictions = model_wait.predict(batch)
     return {"predictions": predictions.tolist()}
 
 # =============================
-# 🔹 /predict_from_db : comparer 100 prédictions avec données réelles
+# 🔹 /predict_from_db
 # =============================
 @app.get("/predict_from_db")
 def predict_from_db(limit: int = 100):
@@ -97,7 +122,7 @@ def predict_from_db(limit: int = 100):
 
     X = df[feature_names]
     y_real = df["total_wait_time_min"]
-    predictions = model.predict(X)
+    predictions = model_wait.predict(X)
 
     results = []
     for pred, real in zip(predictions, y_real):
@@ -112,14 +137,13 @@ def predict_from_db(limit: int = 100):
     }
 
 # =============================
-# 🔹 /predict_with_real : prédiction + valeur réelle correspondante
+# 🔹 /predict_with_real
 # =============================
 @app.post("/predict_with_real")
 def predict_with_real(data: InputData):
     input_array = np.array(data.features).reshape(1, -1)
-    prediction = model.predict(input_array)[0]
+    prediction = model_wait.predict(input_array)[0]
 
-    # Construire la requête SQL pour chercher une ligne identique
     query = f"""
         SELECT total_wait_time_min FROM donnees_pretraitees
         WHERE urgency_level = {data.features[0]}
@@ -137,3 +161,39 @@ def predict_with_real(data: InputData):
         "prediction": float(prediction),
         "real_value": real
     }
+
+# =============================
+# 🔹 /predict_surcharge : prédiction surcharge Oui/Non
+# =============================
+@app.post("/predict_surcharge")
+def predict_surcharge(data: SurchargeInput):
+    try:
+        # Encodage des variables catégorielles
+        day_of_week_encoded = encoders["Day of Week"].transform([data.day_of_week])[0]
+        urgency_level_encoded = encoders["Urgency Level"].transform([data.urgency_level])[0]
+        season_encoded = encoders["Season"].transform([data.season])[0]
+
+        # Conversion de la date
+        visit_timestamp = pd.to_datetime(data.visit_date).timestamp()
+
+        # Construction du vecteur d'entrée
+        input_data = np.array([
+            visit_timestamp,
+            day_of_week_encoded,
+            data.available_beds,
+            urgency_level_encoded,
+            season_encoded,
+            data.local_event,
+            data.nurse_to_patient_ratio
+        ]).reshape(1, -1)
+
+        # Prédiction
+        prediction = model_surcharge.predict(input_data)[0]
+
+        return {
+            "prediction": int(prediction),
+            "surcharge": "Oui" if prediction == 1 else "Non"
+        }
+
+    except Exception as e:
+        return {"error": str(e)}
