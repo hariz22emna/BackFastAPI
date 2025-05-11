@@ -1,4 +1,4 @@
-from fastapi import FastAPI
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import joblib
@@ -6,6 +6,9 @@ import numpy as np
 import pandas as pd
 from typing import List
 from sqlalchemy import create_engine
+from fastapi.staticfiles import StaticFiles
+from fastapi.responses import FileResponse
+
 
 # =============================
 # 🔹 Chargement des modèles
@@ -36,14 +39,44 @@ feature_names = [
 # 🔹 Initialisation FastAPI
 # =============================
 app = FastAPI()
+app.mount("/static", StaticFiles(directory="static"), name="static")
+@app.get("/send_test_alert")
+async def send_test_alert(message: str = "🚨 Alerte test"):
+    await broadcast_notification(message)
+    return {"status": "sent", "message": message}
 
+# =============================
+# 🔹 Middleware CORS
+# =============================
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:53440"],  # Adresse front-end
+    allow_origins=["http://localhost:4200"],  # Adresse front-end Angular
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# =============================
+# 🔹 Gestion WebSocket clients
+# =============================
+connected_clients: List[WebSocket] = []
+
+@app.websocket("/ws/alerts")
+async def websocket_endpoint(websocket: WebSocket):
+    await websocket.accept()
+    connected_clients.append(websocket)
+    try:
+        while True:
+            await websocket.receive_text()
+    except WebSocketDisconnect:
+        connected_clients.remove(websocket)
+
+async def broadcast_notification(message: str):
+    for client in connected_clients:
+        await client.send_text(message)
+@app.get("/test-websocket")
+def get_websocket_test():
+    return FileResponse("static/test-websocket.html")
 
 # =============================
 # 🔹 Modèles d’entrée
@@ -64,14 +97,14 @@ class SurchargeInput(BaseModel):
     nurse_to_patient_ratio: int
 
 # =============================
-# 🔹 Home route
+# 🔹 Home
 # =============================
 @app.get("/")
 def home():
     return {"message": "🎯 API FastAPI pour prédiction du temps d’attente et surcharge"}
 
 # =============================
-# 🔹 /predict : prédiction simple (temps d’attente)
+# 🔹 /predict : prédiction temps d’attente
 # =============================
 @app.post("/predict")
 def predict(data: InputData):
@@ -163,20 +196,16 @@ def predict_with_real(data: InputData):
     }
 
 # =============================
-# 🔹 /predict_surcharge : prédiction surcharge Oui/Non
+# 🔹 /predict_surcharge + 📢 NOTIF SI RISQUE
 # =============================
 @app.post("/predict_surcharge")
-def predict_surcharge(data: SurchargeInput):
+def predict_surcharge(data: SurchargeInput, background_tasks: BackgroundTasks):
     try:
-        # Encodage des variables catégorielles
         day_of_week_encoded = encoders["Day of Week"].transform([data.day_of_week])[0]
         urgency_level_encoded = encoders["Urgency Level"].transform([data.urgency_level])[0]
         season_encoded = encoders["Season"].transform([data.season])[0]
-
-        # Conversion de la date
         visit_timestamp = pd.to_datetime(data.visit_date).timestamp()
 
-        # Construction du vecteur d'entrée
         input_data = np.array([
             visit_timestamp,
             day_of_week_encoded,
@@ -187,13 +216,26 @@ def predict_surcharge(data: SurchargeInput):
             data.nurse_to_patient_ratio
         ]).reshape(1, -1)
 
-        # Prédiction
         prediction = model_surcharge.predict(input_data)[0]
+
+        if prediction == 1:
+            message = (
+                "⚠️ Surcharge détectée pour l’heure suivante !\n"
+                "📌 Recommandations : prévoir du personnel, rediriger certains cas, anticiper les flux."
+            )
+            background_tasks.add_task(broadcast_notification, message)
+            return {
+                "prediction": int(prediction),
+                "surcharge": "Oui",
+                "recommendations": message
+            }
 
         return {
             "prediction": int(prediction),
-            "surcharge": "Oui" if prediction == 1 else "Non"
+            "surcharge": "Non"
         }
 
     except Exception as e:
         return {"error": str(e)}
+
+
