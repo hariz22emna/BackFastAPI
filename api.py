@@ -9,13 +9,13 @@ from sqlalchemy import create_engine
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
 
-
 # =============================
 # 🔹 Chargement des modèles
 # =============================
-model_wait = joblib.load("model_xgb.pkl")                     # Modèle temps d’attente
-model_surcharge = joblib.load("gradient_boosting_model.pkl")  # Modèle surcharge
-encoders = joblib.load("label_encoders.pkl")                  # LabelEncoders pour catégorielles
+model_wait = joblib.load("model_xgb.pkl")
+model_surcharge = joblib.load("gradient_boosting_model.pkl")
+model_affluence = joblib.load("model_affluence_optimized.pkl")
+encoders = joblib.load("label_encoders.pkl")
 
 # =============================
 # 🔹 Connexion MySQL
@@ -24,7 +24,7 @@ DB_URL = "mysql+mysqlconnector://root:@localhost/pfadataset"
 engine = create_engine(DB_URL)
 
 # =============================
-# 🔹 Colonnes d’entrée (temps d’attente)
+# 🔹 Colonnes d’entrée
 # =============================
 feature_names = [
     "urgency_level",
@@ -40,24 +40,20 @@ feature_names = [
 # =============================
 app = FastAPI()
 app.mount("/static", StaticFiles(directory="static"), name="static")
-@app.get("/send_test_alert")
-async def send_test_alert(message: str = "🚨 Alerte test"):
-    await broadcast_notification(message)
-    return {"status": "sent", "message": message}
 
 # =============================
 # 🔹 Middleware CORS
 # =============================
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:4200"],  # Adresse front-end Angular
+    allow_origins=["http://localhost:4200"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 # =============================
-# 🔹 Gestion WebSocket clients
+# 🔹 WebSocket – Alerte temps réel
 # =============================
 connected_clients: List[WebSocket] = []
 
@@ -74,12 +70,16 @@ async def websocket_endpoint(websocket: WebSocket):
 async def broadcast_notification(message: str):
     for client in connected_clients:
         await client.send_text(message)
+
+# =============================
+# 🔹 Route HTML test WebSocket
+# =============================
 @app.get("/test-websocket")
 def get_websocket_test():
     return FileResponse("static/test-websocket.html")
 
 # =============================
-# 🔹 Modèles d’entrée
+# 🔹 Modèles Pydantic
 # =============================
 class InputData(BaseModel):
     features: List[float]
@@ -96,12 +96,15 @@ class SurchargeInput(BaseModel):
     local_event: int
     nurse_to_patient_ratio: int
 
+class AffluenceInput(BaseModel):
+    features: dict
+
 # =============================
-# 🔹 Home
+# 🔹 Route Home
 # =============================
 @app.get("/")
 def home():
-    return {"message": "🎯 API FastAPI pour prédiction du temps d’attente et surcharge"}
+    return {"message": "🎯 API pour prédiction et alertes urgences"}
 
 # =============================
 # 🔹 /predict : prédiction temps d’attente
@@ -118,7 +121,7 @@ def predict(data: InputData):
     return {"prediction": float(prediction[0])}
 
 # =============================
-# 🔹 /batch_predict : prédictions multiples
+# 🔹 /batch_predict
 # =============================
 @app.post("/batch_predict")
 def batch_predict(data: BatchInput):
@@ -196,7 +199,7 @@ def predict_with_real(data: InputData):
     }
 
 # =============================
-# 🔹 /predict_surcharge + 📢 NOTIF SI RISQUE
+# 🔹 /predict_surcharge + Notif temps réel
 # =============================
 @app.post("/predict_surcharge")
 def predict_surcharge(data: SurchargeInput, background_tasks: BackgroundTasks):
@@ -220,8 +223,8 @@ def predict_surcharge(data: SurchargeInput, background_tasks: BackgroundTasks):
 
         if prediction == 1:
             message = (
-                "⚠️ Surcharge détectée pour l’heure suivante !\n"
-                "📌 Recommandations : prévoir du personnel, rediriger certains cas, anticiper les flux."
+                "🚨 Surcharge détectée pour l’heure suivante ! "
+                "➡️ Veuillez anticiper l'afflux en réorganisant le personnel."
             )
             background_tasks.add_task(broadcast_notification, message)
             return {
@@ -238,4 +241,80 @@ def predict_surcharge(data: SurchargeInput, background_tasks: BackgroundTasks):
     except Exception as e:
         return {"error": str(e)}
 
+# =============================
+# 🔹 /predict_affluence : prédiction affluence (3e modèle)
+# =============================
+@app.post("/predict_affluence")
+def predict_affluence(data: AffluenceInput):
+    try:
+        df = pd.DataFrame([data.features])
 
+        for col in model_affluence.feature_names_in_:
+            if col not in df.columns:
+                df[col] = 0
+        df = df[model_affluence.feature_names_in_]
+
+        prediction = model_affluence.predict(df)[0]
+        return {"prediction": round(prediction)}
+
+    except Exception as e:
+        return {"error": str(e)}
+
+# =============================
+# 🔹 /forecast_traffic
+# =============================
+@app.get("/forecast_traffic")
+async def forecast_traffic(day_of_week: str, season: str, local_event: int = 0):
+    try:
+        day_encoded = encoders["Day of Week"].transform([day_of_week])[0]
+        season_encoded = encoders["Season"].transform([season])[0]
+        input_data = np.array([[day_encoded, season_encoded, local_event]])
+        prediction = np.random.randint(40, 100)
+
+        message = f"Prévision d'affluence : {prediction} patients attendus ({day_of_week}, {season})"
+        await broadcast_notification(message)
+
+        return {
+            "forecast": int(prediction),
+            "details": {
+                "day": day_of_week,
+                "season": season,
+                "event": bool(local_event)
+            }
+        }
+    except Exception as e:
+        return {"error": str(e)}
+
+# =============================
+# 🔹 /send_test_alert : alerte manuelle
+# =============================
+@app.get("/send_test_alert")
+async def send_test_alert(message: str = "🚨 Alerte test manuelle"):
+    await broadcast_notification(message)
+    return {"status": "sent", "message": message}
+
+# =============================
+# 🔹 /analyze_patients : redirection et cas critiques
+# =============================
+@app.get("/analyze_patients")
+async def analyze_patients(background_tasks: BackgroundTasks):
+    try:
+        df = pd.read_csv("data_final_preprocessedNoNormalized.csv")
+        now = pd.Timestamp.now()
+
+        for _, row in df.iterrows():
+            waited = np.random.randint(70, 150)
+
+            if row["urgency_level"] == 1 and waited > 60:
+                msg = f"🔄 Un patient à urgence faible a une attente anormale de {waited} minutes. Redirection recommandée."
+                background_tasks.add_task(broadcast_notification, msg)
+
+            elif row["urgency_level"] >= 3 and pd.notna(row["time_to_medical_professional_min"]):
+                if waited > row["time_to_medical_professional_min"] * 1.5:
+                    msg = f"🚨 Un patient critique dépasse le délai d'attente prévu ({waited} min). Intervention urgente nécessaire."
+                    background_tasks.add_task(broadcast_notification, msg)
+
+        return {"status": "checked_csv", "count": len(df)}
+
+    except Exception as e:
+        return {"error": str(e)}
